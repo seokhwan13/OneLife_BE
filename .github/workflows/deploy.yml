@@ -129,7 +129,7 @@ jobs:
 
       - name: Raspberry Pi 배포
         run: |
-          ssh ${{ secrets.RPI_USER }}@${{ secrets.RPI_HOST }} << 'EOF'
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.RPI_USER }}@${{ secrets.RPI_HOST }} << 'EOF'
           set -Eeuo pipefail
 
           OWNER_LC="${{ github.repository_owner }}"
