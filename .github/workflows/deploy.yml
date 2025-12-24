@@ -21,7 +21,6 @@ on:
     branches:
       - develop
       - main
-      - feature/infra
 
 # 권한 최소화/명시화
 permissions:
@@ -116,62 +115,112 @@ jobs:
   # 3) 배포
   # ---------------------------------------------------------
   deploy:
-    name: 배포
+    name: 라즈베리파이 배포
     runs-on: ubuntu-latest
-    needs: [makeTagAndRelease, buildImageAndPush]
+    needs: [ makeTagAndRelease, buildImageAndPush ]
+
     steps:
-      # AWS 자격 구성
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ secrets.AWS_REGION }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
-      # Name 태그로 EC2 인스턴스 조회 (없으면 실패)
-      - name: 인스턴스 ID 가져오기
-        id: get_instance_id
+      - name: SSH Key 설정
         run: |
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=${{ env.EC2_INSTANCE_TAG_NAME }}" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" --output text)
-          [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "No running instance found"; exit 1; }
-          echo "INSTANCE_ID=${INSTANCE_ID}" >> "${GITHUB_ENV}"
+          mkdir -p ~/.ssh
+          echo "${{ secrets.RPI_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.RPI_HOST }} >> ~/.ssh/known_hosts
 
-      # 원격(SSM)으로 배포 수행
-      - name: AWS SSM Send-Command
-        uses: peterkimzz/aws-ssm-send-command@master
-        with:
-          aws-region: ${{ secrets.AWS_REGION }}
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          instance-ids: ${{ env.INSTANCE_ID }}
-          working-directory: /
-          comment: Deploy
-          command: |
-            set -Eeuo pipefail
+      - name: Raspberry Pi 배포
+        run: |
+          ssh ${{ secrets.RPI_USER }}@${{ secrets.RPI_HOST }} << 'EOF'
+          set -Eeuo pipefail
 
-            LOG="/tmp/ssm-$(date +%Y%m%d_%H%M%S).log"
-            exec > >(awk '{ fflush(); print strftime("[%Y-%m-%d %H:%M:%S]"), $0 }' | tee -a "$LOG")
-            exec 2> >(awk '{ fflush(); print strftime("[%Y-%m-%d %H:%M:%S]"), $0 }' | tee -a "$LOG" >&2)
+          OWNER_LC="${{ github.repository_owner }}"
+          OWNER_LC="${OWNER_LC,,}"
+          IMAGE_TAG="${{ needs.makeTagAndRelease.outputs.tag_name }}"
+          IMAGE_REPOSITORY="${{ env.IMAGE_REPOSITORY }}"
+          IMAGE="ghcr.io/${OWNER_LC}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
 
-            source /etc/environment || true
+          CONTAINER_NAME="${{ env.CONTAINER_1_NAME }}"
+          NET="${{ env.DOCKER_NETWORK }}"
 
-            OWNER_LC="${{ github.repository_owner }}"
-            OWNER_LC="${OWNER_LC,,}"
-            IMAGE_TAG='${{ needs.makeTagAndRelease.outputs.tag_name }}'
-            IMAGE_REPOSITORY='${{ env.IMAGE_REPOSITORY }}'
-            IMAGE="ghcr.io/${OWNER_LC}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
-            CONTAINER_1_NAME="${{ env.CONTAINER_1_NAME }}"
-            NET="${{ env.DOCKER_NETWORK }}"
+          echo "📦 Pull image (ARM)"
+          docker pull --platform linux/arm64 $IMAGE
 
-            docker pull $IMAGE
-            docker stop $CONTAINER_1_NAME || true
-            docker rm $CONTAINER_1_NAME || true
-            docker run -d --restart unless-stopped --name $CONTAINER_1_NAME --network $NET -p 8080:8080 $IMAGE
-            {
-              docker images --format '{{.Repository}}:{{.Tag}}' \
-                | grep -F "ghcr.io/${OWNER_LC}/${IMAGE_REPOSITORY}:" \
-                | grep -v -F ":${IMAGE_TAG}" \
-                | grep -v -F ":latest" \
-                | xargs -r docker rmi
-            } || true
+          echo "🛑 Stop old container"
+          docker stop $CONTAINER_NAME || true
+          docker rm $CONTAINER_NAME || true
+
+          echo "🚀 Run new container"
+          docker run -d \
+            --restart unless-stopped \
+            --name $CONTAINER_NAME \
+            --network $NET \
+            -p 8080:8080 \
+            $IMAGE
+
+          echo "🧹 Old image cleanup"
+          docker images --format '{{.Repository}}:{{.Tag}}' \
+            | grep "ghcr.io/${OWNER_LC}/${IMAGE_REPOSITORY}" \
+            | grep -v ":${IMAGE_TAG}" \
+            | xargs -r docker rmi || true
+
+          echo "✅ Deploy finished"
+          EOF
+#  deploy:
+#    name: 배포
+#    runs-on: ubuntu-latest
+#    needs: [makeTagAndRelease, buildImageAndPush]
+#    steps:
+#      # AWS 자격 구성
+#      - uses: aws-actions/configure-aws-credentials@v4
+#        with:
+#          aws-region: ${{ secrets.AWS_REGION }}
+#          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#
+#      # Name 태그로 EC2 인스턴스 조회 (없으면 실패)
+#      - name: 인스턴스 ID 가져오기
+#        id: get_instance_id
+#        run: |
+#          INSTANCE_ID=$(aws ec2 describe-instances \
+#            --filters "Name=tag:Name,Values=${{ env.EC2_INSTANCE_TAG_NAME }}" "Name=instance-state-name,Values=running" \
+#            --query "Reservations[].Instances[].InstanceId" --output text)
+#          [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "No running instance found"; exit 1; }
+#          echo "INSTANCE_ID=${INSTANCE_ID}" >> "${GITHUB_ENV}"
+#
+#      # 원격(SSM)으로 배포 수행
+#      - name: AWS SSM Send-Command
+#        uses: peterkimzz/aws-ssm-send-command@master
+#        with:
+#          aws-region: ${{ secrets.AWS_REGION }}
+#          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#          instance-ids: ${{ env.INSTANCE_ID }}
+#          working-directory: /
+#          comment: Deploy
+#          command: |
+#            set -Eeuo pipefail
+#
+#            LOG="/tmp/ssm-$(date +%Y%m%d_%H%M%S).log"
+#            exec > >(awk '{ fflush(); print strftime("[%Y-%m-%d %H:%M:%S]"), $0 }' | tee -a "$LOG")
+#            exec 2> >(awk '{ fflush(); print strftime("[%Y-%m-%d %H:%M:%S]"), $0 }' | tee -a "$LOG" >&2)
+#
+#            source /etc/environment || true
+#
+#            OWNER_LC="${{ github.repository_owner }}"
+#            OWNER_LC="${OWNER_LC,,}"
+#            IMAGE_TAG='${{ needs.makeTagAndRelease.outputs.tag_name }}'
+#            IMAGE_REPOSITORY='${{ env.IMAGE_REPOSITORY }}'
+#            IMAGE="ghcr.io/${OWNER_LC}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+#            CONTAINER_1_NAME="${{ env.CONTAINER_1_NAME }}"
+#            NET="${{ env.DOCKER_NETWORK }}"
+#
+#            docker pull $IMAGE
+#            docker stop $CONTAINER_1_NAME || true
+#            docker rm $CONTAINER_1_NAME || true
+#            docker run -d --restart unless-stopped --name $CONTAINER_1_NAME --network $NET -p 8080:8080 $IMAGE
+#            {
+#              docker images --format '{{.Repository}}:{{.Tag}}' \
+#                | grep -F "ghcr.io/${OWNER_LC}/${IMAGE_REPOSITORY}:" \
+#                | grep -v -F ":${IMAGE_TAG}" \
+#                | grep -v -F ":latest" \
+#                | xargs -r docker rmi
+#            } || true
